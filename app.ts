@@ -80,6 +80,13 @@ interface RepoRec {
   defaultBranch: string;
   createdAt: string;
   objects: Map<string, StoredObject>;
+  /**
+   * Whole upload-pack responses by request shape. A fetch answer depends only on the object graph
+   * reachable from the requested ids; stored objects are immutable and never deleted, and the cache
+   * key carries the object count, so any addition to the graph misses the cache instead of going
+   * stale.
+   */
+  fetchCache: Map<string, Buffer>;
   /** Full ref name (refs/heads/main) -> object id. HEAD is implicit: the default branch. */
   refs: Map<string, string>;
   labels: Map<string, LabelRec>;
@@ -122,8 +129,10 @@ function sha1Hex(data: Buffer): string {
 
 /** The git object id of a payload: sha1 of "<type> <length>\0" followed by the payload. */
 function hashObject(type: ObjectType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([header, data]));
+  const hash = createHash('sha1');
+  hash.update(`${type} ${data.length}\0`, 'utf8');
+  hash.update(data);
+  return hash.digest('hex');
 }
 
 /** Store an object (deduplicated) and return its id. */
@@ -337,13 +346,53 @@ function collectTreeClosure(repo: RepoRec, treeOid: string, into: Map<string, St
 // Pack files
 // ---------------------------------------------------------------------------
 
+/** Adler-32 of a payload, as the 4 big-endian trailer bytes of a zlib stream. */
+function adler32Trailer(data: Buffer): Buffer {
+  let a = 1;
+  let b = 0;
+  for (let index = 0; index < data.length; index += 1) {
+    a = (a + data[index]!) % 65521;
+    b = (b + a) % 65521;
+  }
+  const trailer = Buffer.alloc(4);
+  trailer.writeUInt32BE(((b << 16) | a) >>> 0, 0);
+  return trailer;
+}
+
 /**
  * Inflate the deflated stream starting at `offset`; returns the output and the offset just past the
- * stream. zlib's sync inflate ignores trailing bytes, so the exact end is found by binary search for
- * the shortest prefix that still inflates (a shorter one throws "unexpected end of file").
+ * stream. zlib's sync inflate ignores trailing bytes but does not say where the stream ended, so the
+ * end is located through the stream's own Adler-32 trailer: inflate the remainder once, then find
+ * the trailer bytes of the output's checksum inside the stream and verify that the prefix ending
+ * there inflates to the same bytes. That is two inflations of the object instead of the binary
+ * search's one per halving; should the trailer not be found (it always is in a well-formed zlib
+ * stream), the search below remains as the fallback: binary search for the shortest prefix that
+ * still inflates (a shorter one throws "unexpected end of file").
  */
 function inflateAt(buffer: Buffer, offset: number): { out: Buffer; next: number } {
   const rest = buffer.subarray(offset);
+  let whole: Buffer | null = null;
+  try {
+    whole = inflateSync(rest);
+  } catch {
+    whole = null;
+  }
+  if (whole !== null) {
+    const trailer = adler32Trailer(whole);
+    let searchFrom = 2;
+    for (;;) {
+      const at = rest.indexOf(trailer, searchFrom);
+      if (at === -1) break;
+      const end = at + 4;
+      try {
+        const prefix = inflateSync(rest.subarray(0, end));
+        if (prefix.equals(whole)) return { out: whole, next: offset + end };
+      } catch {
+        // Not a stream end; keep looking for the trailer bytes.
+      }
+      searchFrom = at + 1;
+    }
+  }
   let lo = 1;
   let hi = rest.length;
   let best: Buffer | null = null;
@@ -518,7 +567,7 @@ function writePack(objects: StoredObject[]): Buffer {
     }
     bytes.push(first);
     parts.push(Buffer.from(bytes));
-    parts.push(deflateSync(object.data));
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = Buffer.from(sha1Hex(body), 'hex');
@@ -744,6 +793,7 @@ function opCreateRepo(forge: Forge, input: { name: string; isPrivate?: boolean; 
     defaultBranch: input.defaultBranch !== undefined && input.defaultBranch !== '' ? input.defaultBranch : 'main',
     createdAt: nowIso(),
     objects: new Map(),
+    fetchCache: new Map(),
     refs: new Map(),
     labels: new Map(),
     items: new Map(),
@@ -1720,8 +1770,23 @@ function readFetchArgs(packets: Packet[], argsStartAfterDelim: boolean): FetchAr
   return args;
 }
 
+/**
+ * The cache key of a fetch request: the protocol version, the repository's object count (any
+ * addition to the object graph changes it, so a cached answer can never outlive the graph it was
+ * computed from) and every request argument the answer depends on.
+ */
+function fetchCacheKey(repo: RepoRec, version: string, args: FetchArgs): string {
+  return [version, repo.objects.size, args.wants.join(' '), args.haves.join(' '), args.shallow.join(' '), args.depth ?? ''].join('|');
+}
+
 function handleFetchV2(ctx: Ctx, repo: RepoRec, packets: Packet[]): void {
   const args = readFetchArgs(packets, true);
+  const cacheKey = fetchCacheKey(repo, 'v2', args);
+  const cached = repo.fetchCache.get(cacheKey);
+  if (cached !== undefined) {
+    sendBody(ctx.res, 200, cached, 'application/x-git-upload-pack-result');
+    return;
+  }
   const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
   const ackHave = args.haves.find((have) => repo.objects.has(have));
   const parts: Buffer[] = [pktLine('acknowledgments\n'), pktLine(ackHave === undefined ? 'NAK\n' : `ACK ${ackHave}\n`), DELIM_PACKET];
@@ -1737,11 +1802,20 @@ function handleFetchV2(ctx: Ctx, repo: RepoRec, packets: Packet[]): void {
     parts.push(sidebandPacket(1, pack.subarray(offset, offset + 32768)));
   }
   parts.push(FLUSH_PACKET);
-  sendBody(ctx.res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const body = Buffer.concat(parts);
+  if (repo.fetchCache.size > 64) repo.fetchCache.clear();
+  repo.fetchCache.set(cacheKey, body);
+  sendBody(ctx.res, 200, body, 'application/x-git-upload-pack-result');
 }
 
 function handleFetchV0(ctx: Ctx, repo: RepoRec, packets: Packet[]): void {
   const args = readFetchArgs(packets, false);
+  const cacheKey = fetchCacheKey(repo, 'v0', args);
+  const cached = repo.fetchCache.get(cacheKey);
+  if (cached !== undefined) {
+    sendBody(ctx.res, 200, cached, 'application/x-git-upload-pack-result');
+    return;
+  }
   const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
   const parts: Buffer[] = [pktLine('NAK\n')];
   const pack = writePack([...plan.objects.values()]);
@@ -1749,7 +1823,10 @@ function handleFetchV0(ctx: Ctx, repo: RepoRec, packets: Packet[]): void {
     parts.push(sidebandPacket(1, pack.subarray(offset, offset + 32768)));
   }
   parts.push(FLUSH_PACKET);
-  sendBody(ctx.res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const body = Buffer.concat(parts);
+  if (repo.fetchCache.size > 64) repo.fetchCache.clear();
+  repo.fetchCache.set(cacheKey, body);
+  sendBody(ctx.res, 200, body, 'application/x-git-upload-pack-result');
 }
 
 function handleUploadPack(ctx: Ctx, repo: RepoRec): void {
