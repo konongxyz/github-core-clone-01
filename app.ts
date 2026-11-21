@@ -10,7 +10,7 @@
 // The token itself is opaque; the login is a constant of the competition, like the port the env owns.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
 /** The token owner's identity (the fixed viewer of the published scenario). */
@@ -87,6 +87,15 @@ interface RepoRec {
    * stale.
    */
   fetchCache: Map<string, Buffer>;
+  /**
+   * Serialized REST issue bodies by item number, each tagged with the items generation it was
+   * built under. Every mutation of an item, its comments or the label set an item's body renders
+   * bumps the generation (touchItems), so a cached body is served only while nothing it renders
+   * has changed; the bytes are exactly what a fresh serialization would produce.
+   */
+  issueBodyCache: Map<number, { generation: number; body: Buffer }>;
+  /** Bumped by touchItems on every item/comment mutation in this repository. */
+  itemsGeneration: number;
   /** Full ref name (refs/heads/main) -> object id. HEAD is implicit: the default branch. */
   refs: Map<string, string>;
   labels: Map<string, LabelRec>;
@@ -117,6 +126,14 @@ class HttpError extends Error {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/**
+ * Record that an item or comment in this repository changed: cached serialized issue bodies built
+ * under earlier generations are no longer served. Called by every item/comment mutation path.
+ */
+function touchItems(repo: RepoRec): void {
+  repo.itemsGeneration += 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -363,11 +380,12 @@ function adler32Trailer(data: Buffer): Buffer {
  * Inflate the deflated stream starting at `offset`; returns the output and the offset just past the
  * stream. zlib's sync inflate ignores trailing bytes but does not say where the stream ended, so the
  * end is located through the stream's own Adler-32 trailer: inflate the remainder once, then find
- * the trailer bytes of the output's checksum inside the stream and verify that the prefix ending
- * there inflates to the same bytes. That is two inflations of the object instead of the binary
- * search's one per halving; should the trailer not be found (it always is in a well-formed zlib
- * stream), the search below remains as the fallback: binary search for the shortest prefix that
- * still inflates (a shorter one throws "unexpected end of file").
+ * the trailer bytes of the output's checksum inside the stream. The stream's own trailer is always
+ * among the occurrences, so when it is the only one it is the end and no second inflation is
+ * needed; with several candidate occurrences each is verified by inflating the prefix ending there
+ * (the first that reproduces the output is the end). Should the trailer not be found at all (it
+ * always is in a well-formed zlib stream), the search below remains as the fallback: binary search
+ * for the shortest prefix that still inflates (a shorter one throws "unexpected end of file").
  */
 function inflateAt(buffer: Buffer, offset: number): { out: Buffer; next: number } {
   const rest = buffer.subarray(offset);
@@ -379,10 +397,18 @@ function inflateAt(buffer: Buffer, offset: number): { out: Buffer; next: number 
   }
   if (whole !== null) {
     const trailer = adler32Trailer(whole);
+    const occurrences: number[] = [];
     let searchFrom = 2;
     for (;;) {
       const at = rest.indexOf(trailer, searchFrom);
       if (at === -1) break;
+      occurrences.push(at);
+      searchFrom = at + 1;
+    }
+    if (occurrences.length === 1) {
+      return { out: whole, next: offset + occurrences[0]! + 4 };
+    }
+    for (const at of occurrences) {
       const end = at + 4;
       try {
         const prefix = inflateSync(rest.subarray(0, end));
@@ -390,7 +416,6 @@ function inflateAt(buffer: Buffer, offset: number): { out: Buffer; next: number 
       } catch {
         // Not a stream end; keep looking for the trailer bytes.
       }
-      searchFrom = at + 1;
     }
   }
   let lo = 1;
@@ -794,6 +819,8 @@ function opCreateRepo(forge: Forge, input: { name: string; isPrivate?: boolean; 
     createdAt: nowIso(),
     objects: new Map(),
     fetchCache: new Map(),
+    issueBodyCache: new Map(),
+    itemsGeneration: 0,
     refs: new Map(),
     labels: new Map(),
     items: new Map(),
@@ -838,6 +865,7 @@ function opCreateIssue(forge: Forge, repo: RepoRec, input: { title: string; body
   repo.nextNumber += 1;
   forge.nextItemDbId += 1;
   repo.items.set(item.number, item);
+  touchItems(repo);
   return item;
 }
 
@@ -878,6 +906,7 @@ function opCreatePull(forge: Forge, repo: RepoRec, input: { title: string; body?
   repo.nextNumber += 1;
   forge.nextItemDbId += 1;
   repo.items.set(item.number, item);
+  touchItems(repo);
   return item;
 }
 
@@ -898,6 +927,7 @@ function opMergePull(forge: Forge, repo: RepoRec, item: ItemRec): string {
   item.mergeCommitSha = sha;
   item.mergedAt = nowIso();
   item.updatedAt = item.mergedAt;
+  touchItems(repo);
   return sha;
 }
 
@@ -916,6 +946,7 @@ function opAddComment(forge: Forge, repo: RepoRec, item: ItemRec, body: string):
   const list = repo.comments.get(item.number) ?? [];
   list.push(comment);
   repo.comments.set(item.number, list);
+  touchItems(repo);
   return comment;
 }
 
@@ -1076,6 +1107,16 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
+}
+
+/**
+ * Whether the request declares no body at all (no transfer encoding and a zero or absent content
+ * length): the common GET case, whose empty body need not be awaited from the stream.
+ */
+function declaresNoBody(req: IncomingMessage): boolean {
+  if (req.headers['transfer-encoding'] !== undefined) return false;
+  const length = req.headers['content-length'];
+  return length === undefined || length === '0';
 }
 
 /** Parse a JSON request body; an empty body counts as {}, malformed JSON is a 400. */
@@ -1431,7 +1472,17 @@ function handleIssues(ctx: Ctx, repo: RepoRec, rest: string[], method: string): 
   if (item === undefined) throw new HttpError(404, 'Not Found');
   if (rest.length === 1) {
     if (method === 'GET') {
-      sendJson(ctx.res, 200, issueJson(repo, item));
+      // The read fast path: a serialized body built under the current items generation is still
+      // exact, so serve its bytes instead of rebuilding and re-serializing the object.
+      const cached = repo.issueBodyCache.get(item.number);
+      if (cached !== undefined && cached.generation === repo.itemsGeneration) {
+        sendBody(ctx.res, 200, cached.body, 'application/json; charset=utf-8');
+        return;
+      }
+      const body = Buffer.from(JSON.stringify(issueJson(repo, item)), 'utf8');
+      if (repo.issueBodyCache.size > 512) repo.issueBodyCache.clear();
+      repo.issueBodyCache.set(item.number, { generation: repo.itemsGeneration, body });
+      sendBody(ctx.res, 200, body, 'application/json; charset=utf-8');
       return;
     }
     if (method === 'PATCH') {
@@ -1445,6 +1496,7 @@ function handleIssues(ctx: Ctx, repo: RepoRec, rest: string[], method: string): 
         item.labels = labels;
       }
       item.updatedAt = nowIso();
+      touchItems(repo);
       sendJson(ctx.res, 200, issueJson(repo, item));
       return;
     }
@@ -1600,6 +1652,19 @@ function sidebandPacket(band: number, data: Buffer): Buffer {
   return pktLine(Buffer.concat([Buffer.from([band]), data]));
 }
 
+/**
+ * The protocol-v2 upload-pack advertisement: it names no refs, so its bytes are the same for every
+ * repository and every request — built once and served as-is.
+ */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT_STRING}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  FLUSH_PACKET,
+]);
+
 type Packet = { kind: 'data'; payload: Buffer } | { kind: 'flush' } | { kind: 'delim' };
 
 /** Parse pkt-lines from the front of a buffer; returns the packets and the offset just past them. */
@@ -1663,15 +1728,7 @@ function handleInfoRefs(ctx: Ctx, repo: RepoRec): void {
   const headTarget = `refs/heads/${repo.defaultBranch}`;
   const headOid = repo.refs.get(headTarget);
   if (service === 'git-upload-pack' && ctx.req.headers['git-protocol'] === 'version=2') {
-    const body = Buffer.concat([
-      pktLine('version 2\n'),
-      pktLine(`agent=${AGENT_STRING}\n`),
-      pktLine('ls-refs=unborn\n'),
-      pktLine('fetch=shallow\n'),
-      pktLine('object-format=sha1\n'),
-      FLUSH_PACKET,
-    ]);
-    sendBody(ctx.res, 200, body, 'application/x-git-upload-pack-advertisement');
+    sendBody(ctx.res, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
     return;
   }
   const caps = service === 'git-upload-pack'
@@ -2527,6 +2584,7 @@ const GQL_RESOLVERS: Record<string, Record<string, GqlResolver>> = {
       if (located === null) throw new Error('issue not found for closeIssue');
       located.item.state = 'closed';
       located.item.updatedAt = nowIso();
+      touchItems(located.repo);
       return { __type: 'CloseIssuePayload', issue: issueParent(located.repo, located.item) };
     },
     createPullRequest: (exec, _parent, args) => {
@@ -3115,14 +3173,19 @@ function handleMcp(ctx: Ctx): void {
 // The application
 // ---------------------------------------------------------------------------
 
+/** Process-local request counter: request ids only need to be non-empty, and minting a random UUID costs a syscall per request. */
+let requestCounter = 0;
+
 export function createApp(): Server {
   const forge = createForge();
   const server = createServer((req, res) => {
-    res.setHeader('x-github-request-id', randomUUID());
+    res.setHeader('x-github-request-id', `req-${++requestCounter}`);
     void (async () => {
       try {
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-        const body = await readBody(req);
+        // A request that declares no body — the common case for every read — skips the body
+        // accumulation entirely.
+        const body = (req.method === 'GET' || req.method === 'HEAD') && declaresNoBody(req) ? Buffer.alloc(0) : await readBody(req);
         const segments = url.pathname
           .split('/')
           .filter((piece) => piece !== '')
